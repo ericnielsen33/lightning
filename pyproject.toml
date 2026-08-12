@@ -1,0 +1,21 @@
+[tool.poetry]
+name = "lightning"
+version = "0.1.0"
+description = "An opinionated libary for modeling and common analytics tasks."
+authors = ["Eric <ericnielsen33@gmail.com>"]
+readme = "README.md"
+packages = [
+	{ include = "lightning", from = "src" }
+]
+
+[tool.poetry.dependencies]
+python = "3.12.3"
+mlflow = ">=2.0"
+plotly = ">=5.0"
+pyspark = ">=4.0.0"
+delta-spark = "4.0.0"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
