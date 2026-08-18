@@ -20,9 +20,9 @@ class Conversions(PublicWorksDataSource):
                     order_date DATE NOT NULL,
                     purchased_product_total_cnt INT NOT NULL,
                     purchased_product_total_usd DOUBLE NOT NULL,
-                    CONSTRAINT pk_measurement_conversions PRIMARY KEY (measurable_space, measurable_id, brand_id, sku_id, order_date)
+                    CONSTRAINT pk_{self.table()} PRIMARY KEY (measurable_space, measurable_id, brand_id, sku_id, order_date)
                 )
                 USING DELTA
                 PARTITIONED BY (measurable_space, order_date)
             """.strip())
-            return self.read()
+            return self.read().limit(5)
