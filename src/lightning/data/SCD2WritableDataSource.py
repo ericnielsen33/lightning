@@ -1,10 +1,10 @@
-from abc import ABC
+from abc import ABC, abstractmethod
+from functools import reduce
+from operator import and_
 from typing import List, Optional
-from collections import Set
 
-from delta.tables import DeltaTable
 from pyspark.sql import DataFrame, Column
-from pyspark.sql.types import *
+from pyspark.sql.types import DateType
 from pyspark.sql.functions import current_date, col, lit
 from lightning.data.WritableDataSource import WritableDataSource
 
@@ -12,20 +12,23 @@ from lightning.data.WritableDataSource import WritableDataSource
 class SCD2WritableDataSource(WritableDataSource, ABC):
     """Abstract base class for SCD2 (slowly changing dimension type 2) writable data sources.
 
-    Subclasses should provide concrete implementations for writing/reading if needed.
+    Subclasses must provide:
+    - partition_keys: columns the table is physically partitioned by
+    - merge_keys: columns compared to detect whether a record's attributes changed
 
-    Methods to complete:
-    - lookup_keys: list of column names used to identify unique records
-    - merge_keys: list of column names used to match records when merging
+    Assumes the table schema is exactly partition_keys | merge_keys | {start_date, end_date},
+    and that partition_keys and merge_keys are disjoint column sets.
     """
 
     def __init__(self):
        super().__init__()
 
-    def partition_keys(self) -> Set[str]:
+    @abstractmethod
+    def partition_keys(self) -> List[str]:
         pass
 
-    def merge_keys(self) -> Set[str]:
+    @abstractmethod
+    def merge_keys(self) -> List[str]:
         pass
 
     def start_date_column_ref(self) -> str:
@@ -53,136 +56,137 @@ class SCD2WritableDataSource(WritableDataSource, ABC):
             return [col(key) for key in self.merge_keys()]
 
     def start_date_column(self, date_expr: Optional[Column] = None, alias: Optional[str] = None) -> Column:
-        if date_expr is not None and alias is not None:
-            return date_expr.cast(DateType()).alias(f"{alias}.{self.start_date_column_ref()}")
-        if date_expr is not None and alias is None:
-            return date_expr.cast(DateType()).alias(self.start_date_column_ref())
-        if date_expr is None and alias is not None:
-            return col(self.start_date_column_ref()).alias(f"{alias}.{self.start_date_column_ref()}")
-        else:
-            return col(self.start_date_column_ref())
+        ref = self.start_date_column_ref()
+        if date_expr is not None:
+            return date_expr.cast(DateType()).alias(ref)
+        if alias is not None:
+            return col(f"{alias}.{ref}").alias(ref)
+        return col(ref)
 
     def end_date_column(self, date_expr: Optional[Column] = None, alias: Optional[str] = None) -> Column:
-        if date_expr is not None and alias is not None:
-            return date_expr.cast(DateType()).alias(f"{alias}.{self.end_date_column_ref()}")
-        if date_expr is not None and alias is None:
-            return date_expr.cast(DateType()).alias(self.end_date_column_ref())
-        if date_expr is None and alias is not None:
-            return col(self.end_date_column_ref()).alias(f"{alias}.{self.end_date_column_ref()}")
-        else:
-            return col(self.end_date_column_ref())
+        ref = self.end_date_column_ref()
+        if date_expr is not None:
+            return date_expr.cast(DateType()).alias(ref)
+        if alias is not None:
+            return col(f"{alias}.{ref}").alias(ref)
+        return col(ref)
 
     def merge_condition(self) -> Column:
-        condition = (
-            self.merge_keys()
-                .map(lambda key: col(f"{self.target_alias()}.{key}") == col(f"{self.updates_alias()}.{key}"))
-                .reduce(lambda a, b: a & b)
-        )   
-        return condition
+        conditions = [
+            col(f"{self.target_alias()}.{key}") == col(f"{self.updates_alias()}.{key}")
+            for key in self.merge_keys()
+        ]
+        return reduce(and_, conditions)
 
-    def current_entities(self, **paritions: Column) -> DataFrame:
-        target = (
-            self.read()
-            .filter(self.end_date_column() == lit(None))
-            .filter(*[col(field) == value for field, value in paritions.items()])
-        )
+    def _partition_filter(self, partitions: dict) -> Optional[Column]:
+        conditions = [col(field) == value for field, value in partitions.items()]
+        return reduce(and_, conditions) if conditions else None
+
+    def current_entities(self, **partitions: Column) -> DataFrame:
+        """
+        Rows in the target partitions that are not expired (end_date is null).
+        """
+        target = self.read().filter(self.end_date_column().isNull())
+        condition = self._partition_filter(partitions)
+        if condition is not None:
+            target = target.filter(condition)
         return target
 
-    def historic_entities(self, partitions: Column) -> DataFrame:
+    def historic_entities(self, **partitions: Column) -> DataFrame:
         """
-        Processes previosly expired data from the target patitions. These values will remain unchanged.
-        They must still be includeded in the merge operation using dynamic parition
-        overwrite mode, while partitioning by the partion keys.
+        Previously expired data for the target partitions. These values remain unchanged
+        but must still be included in the merge, since a dynamic partition overwrite
+        replaces every row in the affected partitions.
         """
-        target = (
-            self.read()
-                .filter(self.end_date_column().isNotNull)
-                .filter(*[col(field) == value for field, value in paritions.items()])
+        target = self.read().filter(self.end_date_column().isNotNull())
+        condition = self._partition_filter(partitions)
+        if condition is not None:
+            target = target.filter(condition)
+        return target.select(
+            *self.partition_columns(),
+            *self.merge_columns(),
+            self.start_date_column(),
+            self.end_date_column(),
         )
-        return target
-    
-    def matched_current_entities(self, updates: DataFrame, **paritions: Column) -> DataFrame:
+
+    def matched_current_entities(self, current: DataFrame, updates: DataFrame) -> DataFrame:
         """
-        Processes entires that exisit in both the target and the updates. As all of
-        the values match for each merge key, each entry will be extended which is relected
-        by a null end_date.
+        Entries that exist in both the current target and the updates with identical
+        merge_keys. Nothing changed, so these carry their existing start_date forward
+        with a null end_date.
         """
-        target = self.current_entities(**paritions)
         to_merge = (
-            target.alias(self.target_alias())
+            current.alias(self.target_alias())
             .join(
                 updates.alias(self.updates_alias()),
-                self.merge_condition(), 
-                how="inner"
-                )
+                self.merge_condition(),
+                how="inner",
+            )
             .select(
-                *self.partition_columns(self.target_alias()), 
+                *self.partition_columns(self.target_alias()),
                 *self.merge_columns(self.target_alias()),
                 self.start_date_column(alias=self.target_alias()),
-                self.end_date_column(date_expr=lit(None))
-                )
-        ) 
+                self.end_date_column(date_expr=lit(None)),
+            )
+        )
         return to_merge
 
-    def new_current_entities(self, updates: DataFrame, **paritions: Column) -> DataFrame:
+    def new_current_entities(self, current: DataFrame, updates: DataFrame) -> DataFrame:
         """
-        Processes entries that are in the updates dataframe but not in the target
+        Entries that are in the updates DataFrame but not in the current target.
         """
-        target = self.current_entities(**paritions)
         to_merge = (
-            updates
-                .alias(self.updates_alias())
-                .join(
-                    target.alias(self.target_alias()),
-                    self.merge_condition(),
-                    "leftanti")
+            updates.alias(self.updates_alias())
+            .join(
+                current.alias(self.target_alias()),
+                self.merge_condition(),
+                "leftanti",
+            )
             .select(
-                *self.partition_columns(self.updates_alias()), 
+                *self.partition_columns(self.updates_alias()),
                 *self.merge_columns(self.updates_alias()),
                 self.start_date_column(date_expr=current_date()),
-                self.end_date_column(date_expr=lit(None))
-                )
+                self.end_date_column(date_expr=lit(None)),
+            )
         )
         return to_merge
 
-    def expiring_entitites(self, updates: DataFrame, **partitions: Column) -> DataFrame:
+    def expiring_entities(self, current: DataFrame, updates: DataFrame) -> DataFrame:
         """
-            Proceses values in the target, that have new dimension values to populate
-            from the updates DataFrame. These values will expire and the end_date_column
-            being set to the current date.
+        Entries in the current target whose merge_keys no longer appear in the updates
+        DataFrame -- i.e. a tracked attribute changed. These expire as of today.
         """
-        target = self.current_entities(**partitions)
         to_merge = (
-            target.alias(self.target_alias())
+            current.alias(self.target_alias())
             .join(
                 updates.alias(self.updates_alias()),
-                self.merge_condition(), 
-                how="leftanti"
-                )
+                self.merge_condition(),
+                how="leftanti",
+            )
             .select(
-                *self.partition_columns(self.target_alias()), 
+                *self.partition_columns(self.target_alias()),
                 *self.merge_columns(self.target_alias()),
                 self.start_date_column(alias=self.target_alias()),
-                self.end_date_column(date_expr=current_date())
-                )
-        ) 
+                self.end_date_column(date_expr=current_date()),
+            )
+        )
         return to_merge
-        
+
     def merge(self, updates: DataFrame, **partitions: Column) -> DataFrame:
+        current = self.current_entities(**partitions)
+
         merged = (
             self.historic_entities(**partitions)
-                .union(self.matched_current_entities(updates, **partitions))
-                .union(self.new_current_entities(updates, **partitions))
-                .union(self.expiring_entitites(updates, **partitions))
-                
+                .unionByName(self.matched_current_entities(current, updates))
+                .unionByName(self.new_current_entities(current, updates))
+                .unionByName(self.expiring_entities(current, updates))
         )
 
-        merged.write\
-            .format(self.format())\
-            .mode("overwrite")\
-            .partitionBy(list(self.partition_keys))\
-            .option("partitionOverwriteMode", "dynamic")\
+        merged.write \
+            .format(self.format()) \
+            .mode("overwrite") \
+            .partitionBy(list(self.partition_keys())) \
+            .option("partitionOverwriteMode", "dynamic") \
             .saveAsTable(self.uri())
-        
-        return merged.limit(100)
 
+        return merged.limit(100)
